@@ -18,6 +18,7 @@ CHAT_MODELS = [
     "gemini-3.5-flash",
     "gemini-3.1-flash-lite",
 ]
+REQUEST_TIMEOUT_MS = 90_000  # no single API request may hang longer than this
 RETRYABLE_CODES = {429, 500, 503, 504}
 SKIP_MODEL_CODES = {404}
 
@@ -141,22 +142,27 @@ Question: {question}
 Answer:"""
 
 
-def answer_question(client, question: str, hits: list[dict], history: list[dict]) -> str:
+def answer_question(client, question: str, hits: list[dict], history: list[dict],
+                    on_status=None, log: list | None = None) -> str:
+    """Try each chat model in order. Timeouts, busy and retired models all
+    move on to the next model so the app can never hang on one request."""
+    log = log if log is not None else []
     prompt = build_prompt(question, hits, history)
-    last_error = None
     for model in CHAT_MODELS:
+        if on_status:
+            on_status(f"Writing the answer with `{model}`...")
         try:
             response = call_with_retry(
                 lambda m=model: client.models.generate_content(model=m, contents=prompt),
-                max_retries=3,
+                max_retries=2,
             )
             if response.text:
                 return response.text
+            log.append(f"{model}: empty response")
         except errors.APIError as err:
-            last_error = err
-            if err.code in SKIP_MODEL_CODES or err.code in RETRYABLE_CODES:
-                continue  # try the next model
-            raise
-    if last_error:
-        raise last_error
-    raise RuntimeError("The model returned an empty response.")
+            log.append(f"{model}: API error {err.code} - {str(err.message)[:150]}")
+            if err.code not in RETRYABLE_CODES and err.code not in SKIP_MODEL_CODES:
+                raise
+        except Exception as err:  # timeouts, network problems
+            log.append(f"{model}: {type(err).__name__} - {str(err)[:150]}")
+    raise RuntimeError("All chat models failed.")
